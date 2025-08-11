@@ -14,7 +14,7 @@ env:
   REPO_NAME: security-command-centre-repo
   SERVICE_NAME: cloud-run-scc-service
   ORG_ID: 546020416291
-  SOURCE_ID: container_vulnerability
+  SOURCE_ID: 10173119974561045144
 
 jobs:
   deploy:
