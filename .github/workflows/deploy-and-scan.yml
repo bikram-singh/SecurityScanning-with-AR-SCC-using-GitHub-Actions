@@ -1,0 +1,102 @@
+name: Deploy Vulnerability Check SecurityScanning-with-AR-SCC-using-GitHub-Actions
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  id-token: write  # Required for Workload Identity Federation
+
+env:
+  PROJECT_ID: github-actions-111
+  REGION: us-central1
+  REPO_NAME: security-command-centre-repo
+  SERVICE_NAME: cloud-run-scc-service
+  ORG_ID: 546020416291
+  SOURCE_ID: container_vulnerability
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP with Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "projects/1070327104780/locations/global/workloadIdentityPools/security-command-cente/providers/github-ssc"
+          service_account: "ssc-scan-sa@${{ env.PROJECT_ID }}.iam.gserviceaccount.com"
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Build & push Docker image to Artifact Registry
+        run: |
+          IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$SERVICE_NAME:${{ github.sha }}"
+          gcloud builds submit --tag $IMAGE
+
+      - name: Deploy to Cloud Run
+        run: |
+          IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$SERVICE_NAME:${{ github.sha }}"
+          gcloud run deploy $SERVICE_NAME \
+            --image $IMAGE \
+            --region $REGION \
+            --platform managed \
+            --allow-unauthenticated
+
+      - name: Install dependencies for vulnerability check
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install google-cloud-securitycenter
+
+      - name: Check vulnerabilities in Security Command Center
+        id: check_scc
+        run: |
+          python3 <<EOF
+          import sys
+          import time
+          from google.cloud import securitycenter_v1
+
+          PROJECT_ID = "${{ env.PROJECT_ID }}"
+          ORG_ID = "${{ env.ORG_ID }}"
+          SOURCE_ID = "${{ env.SOURCE_ID }}"
+          REGION = "${{ env.REGION }}"
+          REPO_NAME = "${{ env.REPO_NAME }}"
+          SERVICE_NAME = "${{ env.SERVICE_NAME }}"
+          IMAGE = f"{REGION}-docker.pkg.dev/{PROJECT_ID}/{REPO_NAME}/{SERVICE_NAME}:${{ github.sha }}"
+
+          client = securitycenter_v1.SecurityCenterClient()
+          parent = f"organizations/{ORG_ID}/sources/{SOURCE_ID}"
+
+          print('Waiting up to 3 minutes for vulnerability findings...')
+
+          findings = []
+          for _ in range(30):
+              findings_iter = client.list_findings(request={"parent": parent})
+              findings = []
+              for finding_result in findings_iter:
+                  f = finding_result.finding
+                  if f.category == "VULNERABILITY" and IMAGE in f.resource_name:
+                      findings.append(f)
+              if findings:
+                  break
+              time.sleep(6)
+          else:
+              print("No vulnerability findings found.")
+              sys.exit(0)
+
+          high_vulns = [f for f in findings if f.severity.name in ["CRITICAL", "HIGH"]]
+
+          if high_vulns:
+              print("High or critical vulnerabilities detected:")
+              for vuln in high_vulns:
+                  print(f"- {vuln.name} Severity: {vuln.severity.name}")
+              sys.exit(1)
+          else:
+              print("No high or critical vulnerabilities found. Deployment safe.")
+          EOF
