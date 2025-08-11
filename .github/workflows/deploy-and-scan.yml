@@ -51,7 +51,7 @@ jobs:
       - name: Install dependencies for vulnerability check
         run: |
           python3 -m pip install --upgrade pip
-          pip install google-cloud-securitycenter
+          pip install google-auth requests
 
       - name: Check vulnerabilities in Security Command Center
         id: check_scc
@@ -59,29 +59,36 @@ jobs:
           python3 <<EOF
           import sys
           import time
-          from google.cloud import securitycenter_v1
+          import google.auth
+          from google.auth.transport.requests import AuthorizedSession
 
-          PROJECT_ID = "${{ env.PROJECT_ID }}"
           ORG_ID = "${{ env.ORG_ID }}"
-          SOURCE_ID = "${{ env.SOURCE_ID }}"
           REGION = "${{ env.REGION }}"
+          PROJECT_ID = "${{ env.PROJECT_ID }}"
           REPO_NAME = "${{ env.REPO_NAME }}"
           SERVICE_NAME = "${{ env.SERVICE_NAME }}"
-          IMAGE = f"{REGION}-docker.pkg.dev/{PROJECT_ID}/{REPO_NAME}/{SERVICE_NAME}:${{ github.sha }}"
+          COMMIT_SHA = "${{ github.sha }}"
 
-          client = securitycenter_v1.SecurityCenterClient()
-          parent = f"organizations/{ORG_ID}/sources/{SOURCE_ID}"
+          IMAGE = f"{REGION}-docker.pkg.dev/{PROJECT_ID}/{REPO_NAME}/{SERVICE_NAME}:{COMMIT_SHA}"
 
-          print('Waiting up to 3 minutes for vulnerability findings...')
+          credentials, project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+          authed_session = AuthorizedSession(credentials)
+
+          # Use wildcard '-' for source to get findings from all sources
+          url = f"https://securitycenter.googleapis.com/v2/organizations/{ORG_ID}/sources/-/findings"
+
+          print("Waiting up to 3 minutes for vulnerability findings...")
 
           findings = []
           for _ in range(30):
-              findings_iter = client.list_findings(request={"parent": parent})
+              response = authed_session.get(url)
+              response.raise_for_status()
+              findings_response = response.json()
+
               findings = []
-              for finding_result in findings_iter:
-                  f = finding_result.finding
-                  if f.category == "VULNERABILITY" and IMAGE in f.resource_name:
-                      findings.append(f)
+              for finding in findings_response.get("findings", []):
+                  if finding.get("category") == "VULNERABILITY" and IMAGE in finding.get("resourceName", ""):
+                      findings.append(finding)
               if findings:
                   break
               time.sleep(6)
@@ -89,12 +96,12 @@ jobs:
               print("No vulnerability findings found.")
               sys.exit(0)
 
-          high_vulns = [f for f in findings if f.severity.name in ["CRITICAL", "HIGH"]]
+          high_vulns = [f for f in findings if f.get("severity") in ["CRITICAL", "HIGH"]]
 
           if high_vulns:
               print("High or critical vulnerabilities detected:")
               for vuln in high_vulns:
-                  print(f"- {vuln.name} Severity: {vuln.severity.name}")
+                  print(f"- {vuln.get('name')} Severity: {vuln.get('severity')}")
               sys.exit(1)
           else:
               print("No high or critical vulnerabilities found. Deployment safe.")
